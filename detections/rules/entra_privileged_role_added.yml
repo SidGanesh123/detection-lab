@@ -1,0 +1,35 @@
+title: User Added to Privileged Entra ID Role
+id: <6e6922a7-399b-4fea-a1ef-d49d5cf193e4>
+status: experimental
+description: >
+  Detects an account being added to a privileged directory role in Entra ID.
+  This is the role-based escalation path: an identity that can modify role
+  membership; grants itself, or an account it controls, privilege beyond
+  what the compromised account started with.
+author: Siddharth Ganesh
+date: 2026/10/17
+references:
+  - https://attack.mitre.org/techniques/T1098/003/
+tags:
+  - attack.persistence
+  - attack.privilege-escalation
+  - attack.t1098.003
+logsource:
+  product: azure
+  service: auditlogs
+detection:
+  selection_operation:
+    properties.message: 'Add member to role'
+  selection_privileged:
+    properties.targetResources|contains:
+      - 'Global Administrator'
+      - 'Privileged Role Administrator'
+      - 'Privileged Authentication Administrator'
+      - 'Application Administrator'
+      - 'User Administrator'
+  condition: selection_operation and selection_privileged
+falsepositives:
+  - Privileged Identity Management activating an eligible role assignment
+  - Planned administrative onboarding, which should map to a change record
+level: high
+
