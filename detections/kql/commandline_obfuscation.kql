@@ -1,0 +1,147 @@
+// =============================================================================
+// Custom Detection: Command-Line Obfuscation (heuristic scoring)
+//
+// Table      : DeviceProcessEvents  (Defender for Endpoint process telemetry)
+// MITRE      : T1027.010 Obfuscated Files or Information: Command Obfuscation
+//              T1059     Command and Scripting Interpreter
+// Author     : Siddharth Ganesh
+// Status     : experimental - untested against live data
+//
+// WHY THIS IS NOT A KEYWORD LIST
+// For Signature detections for obfuscation, the attacker's
+// whole goal is to make the keyword unmatchable. This rule does not look for bad strings - it looks for
+// the STRUCTURAL FINGERPRINT of a string that has been deliberately changed.
+
+// =============================================================================
+
+let lookback         = 1h;
+let ingestion_grace  = 30m;   // see note on ingestion_time() at the bottom
+let score_threshold  = 6;
+
+// --- Tuning allowlist. Keep NARROW and justified; each entry is a documented
+// --- benign positive
+let allowed_initiators = dynamic([
+    "ccmexec.exe",          // SCCM / Configuration Manager task sequences
+    "msiexec.exe",          // bootstrappers installer
+    "setuphost.exe"
+]);
+let allowed_path_fragments = dynamic([
+    @"\program files\*microsoft\reportingaddin\", //test company (Microsoft)
+    @"\windows\ccm\"
+]);
+
+// Keywords that matter only once de-obfuscated.
+let interesting_keywords = dynamic([
+    "powershell", "pwsh", "invoke-expression", "iex", "downloadstring",
+    "downloadfile", "frombase64string", "certutil", "bitsadmin", "mshta",
+    "rundll32", "regsvr32", "wmic", "curl", "invoke-webrequest", "start-process",
+    "add-mppreference", "set-mppreference", "hidden", "bypass"
+]);
+
+DeviceProcessEvents
+| where Timestamp >= ago(lookback + ingestion_grace)
+| where isnotempty(ProcessCommandLine)
+| extend Cmd      = ProcessCommandLine
+| extend LowerCmd = tolower(Cmd)
+| extend CmdLen   = strlen(Cmd)
+// Very short command lines cannot carry meaningful obfuscation and are most of
+// the volume. Filtering early is both correctness and cost.
+| where CmdLen between (40 .. 32000)
+//
+// --- character-class census ---------------------------------------------------
+| extend CaretCount    = countof(Cmd, "^")            // cmd.exe escape character
+| extend BacktickCount = countof(Cmd, "`")            // PowerShell escape character
+| extend PlusCount     = countof(Cmd, "+")            // string concatenation
+| extend QuoteCount    = countof(Cmd, '"')
+| extend PercentCount  = countof(Cmd, "%")            // env-var substring tricks
+| extend AlphaNumCount = countof(Cmd, @'[A-Za-z0-9]', "regex")
+| extend SpecialRatio  = round(todouble(CmdLen - AlphaNumCount) / todouble(CmdLen), 3)
+//
+// --- SIG-A: de-obfuscation reveals a keyword the raw string hid --------------
+// Strip the characters used purely to break up tokens, then compare.
+| extend Deobfuscated   = tolower(replace_regex(Cmd, @'[\^`"''+]', ""))
+| extend RawHasKeyword  = LowerCmd      has_any (interesting_keywords)
+| extend DeobHasKeyword = Deobfuscated  has_any (interesting_keywords)
+| extend SIG_A_RevealedKeyword = DeobHasKeyword and not(RawHasKeyword)
+//
+// --- SIG-B: encoded-command flag, including PowerShell prefix abbreviations --
+// PowerShell accepts any unambiguous prefix of a parameter name, so -e, -en,
+// -enc and -EncodedCommand are all equivalent. A rule that only matches the
+// full spelling is trivially bypassed. Same for -nop / -noni / -w / -ep.
+| extend SIG_B_EncodedFlag = LowerCmd matches regex
+      @'[-/–]e(n(c(o(d(e(d(c(o(m(m(a(n(d)?)?)?)?)?)?)?)?)?)?)?)?)?\s+[A-Za-z0-9+/=]{20,}'
+//
+// --- SIG-C: long base64-looking blob anywhere in the line -------------------
+| extend SIG_C_LongB64 = Cmd matches regex @'[A-Za-z0-9+/]{60,}={0,2}'
+//
+// --- SIG-D: environment-variable substring construction ---------------------
+// e.g. %PROGRAMDATA:~0,1% or $env:ComSpec.Substring(4,3) - builds a string out
+// of slices of legitimate variables so no keyword is ever literal.
+| extend SIG_D_EnvSubstring = Cmd matches regex @'%\w+:~[\-]?\d+'
+                           or LowerCmd matches regex @'\$env:\w+\s*\.?\s*substring'
+//
+// --- SIG-E: character-code reassembly ---------------------------------------
+| extend SIG_E_CharArray = LowerCmd has_any ("[char]", "[convert]::", "-join", "[string]::join", "::fromcharcode")
+//
+// --- SIG-F: format-operator and reversal tricks -----------------------------
+| extend SIG_F_FormatOrReverse = LowerCmd matches regex @'\]\s*-f\s*'          // ("{1}{0}" -f ...)
+                               or LowerCmd has_any ("[-1..-", "::reverse", "-replace")
+//
+// --- scoring ----------------------------------------------------------------
+// Weights are deliberate, not uniform: SIG-A is near-conclusive on its own,
+// the character-ratio signals are weak individually and only matter in company.
+| extend Score =
+      iff(SIG_A_RevealedKeyword, 6, 0)
+    + iff(SIG_B_EncodedFlag,     4, 0)
+    + iff(SIG_D_EnvSubstring,    4, 0)
+    + iff(SIG_C_LongB64,         3, 0)
+    + iff(SIG_E_CharArray,       3, 0)
+    + iff(SIG_F_FormatOrReverse, 2, 0)
+    + iff(CaretCount    >= 5,    3, 0)
+    + iff(BacktickCount >= 3,    3, 0)
+    + iff(PlusCount     >= 6,    2, 0)
+    + iff(PercentCount  >= 8,    2, 0)
+    + iff(SpecialRatio  > 0.35,  2, 0)
+    + iff(CmdLen        > 1200,  1, 0)
+| where Score >= score_threshold
+//
+// --- tuning -----------------------------------------------------------------
+| where tolower(InitiatingProcessFileName) !in (allowed_initiators)
+| where not(tolower(FolderPath) has_any (allowed_path_fragments))
+//
+// --- analyst-facing output --------------------------------------------------
+// Name the signals that fired. An alert that says "score 11" is not actionable;
+// one that says "revealed keyword + caret escaping" tells the analyst what to
+// look at first and lets them judge the verdict without re-running the query.
+| extend SignalsFired = array_concat(
+      iff(SIG_A_RevealedKeyword,  dynamic(["revealed-keyword-after-deobfuscation"]), dynamic([])),
+      iff(SIG_B_EncodedFlag,      dynamic(["encoded-command-flag"]),                 dynamic([])),
+      iff(SIG_C_LongB64,          dynamic(["long-base64-blob"]),                     dynamic([])),
+      iff(SIG_D_EnvSubstring,     dynamic(["env-var-substring-build"]),              dynamic([])),
+      iff(SIG_E_CharArray,        dynamic(["char-code-reassembly"]),                 dynamic([])),
+      iff(SIG_F_FormatOrReverse,  dynamic(["format-operator-or-reversal"]),          dynamic([])),
+      iff(CaretCount >= 5,        dynamic(["caret-escaping"]),                       dynamic([])),
+      iff(BacktickCount >= 3,     dynamic(["backtick-escaping"]),                    dynamic([]))
+  )
+| project
+    Timestamp,
+    ReportId,                       // required by Defender custom detection rules
+    DeviceId,
+    DeviceName,
+    AccountDomain,
+    AccountName,
+    AccountSid,
+    Score,
+    SignalsFired,
+    FileName,
+    FolderPath,
+    ProcessCommandLine,
+    Deobfuscated,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessParentFileName,
+    ProcessIntegrityLevel,
+    SHA256
+| order by Score desc, Timestamp desc
+
+
