@@ -1,0 +1,29 @@
+title: Entra ID Directory Enumeration (single-event primitive)
+id: 8a7e38c5-a1ff-4882-9341-f0cbf50e63d4
+status: experimental
+description: >
+  Single-event primitive for directory enumeration against Entra ID, the
+  AzureHound pattern. NOTE: the real detection is a volume-over-time
+  analytic in the backend query language - see
+  detections/kql/entra_enumeration_burst.kql. Sigma matches one event at a
+  time and cannot express "one identity, N distinct reads, in M minutes".
+author: Siddharth Ganesh
+date: 2026/10/17
+references:
+  - https://attack.mitre.org/techniques/T1087/004/
+tags:
+  - attack.discovery
+  - attack.t1087.004
+logsource:
+  product: azure
+  service: auditlogs
+detection:
+  selection:
+    properties.message|startswith:
+      - 'List '
+      - 'Get '
+  condition: selection
+falsepositives:
+  - Governance, IGA and CSPM service principals enumerating on a schedule
+  - Directory sync and HR integration connectors
+level: informational
