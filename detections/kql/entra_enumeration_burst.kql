@@ -1,0 +1,35 @@
+// Directory enumeration burst - aggregation partner rule for sigma detection.
+// One identity performing a high volume of distinct directory read
+// operations in a short window. (AzureHound behaviour)
+//
+// UNCALIBRATED: the thresholds below are starting points, currently untuned
+// With production telemetry I would histogram distinct-operation
+// counts per identity per hour and set the threshold where the benign
+// positive rate becomes acceptable.
+
+let window = 1h;
+let min_distinct_ops = 20;
+let min_total_reads  = 100;
+AuditLogs
+| where TimeGenerated >= ago(window)
+| where OperationName startswith "List " or OperationName startswith "Get "
+| extend actor = tostring(InitiatedBy.user.userPrincipalName)
+| extend app   = tostring(InitiatedBy.app.displayName)
+| extend identity = coalesce(actor, app)
+| where isnotempty(identity)
+| summarize
+    distinct_ops = dcount(OperationName),
+    total_reads  = count(),
+    failed_reads = countif(Result != "success"),
+    operations   = make_set(OperationName, 20),
+    first_seen   = min(TimeGenerated),
+    last_seen    = max(TimeGenerated)
+  by identity
+| where distinct_ops >= min_distinct_ops and total_reads >= min_total_reads
+| extend duration_minutes = datetime_diff('minute', last_seen, first_seen)
+| order by total_reads desc
+
+// WHY failed_reads IS SURFACED, not filtered out:
+// an identity enumerating objects when it has not read rights is
+// interesting, as thats what a mapping tool typically looks like.
+
